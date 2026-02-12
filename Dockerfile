@@ -55,7 +55,7 @@ ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
 # -- 3. Set VNC password -------------------------------------------
 RUN mkdir -p /root/.vnc && \
-    echo "$VNC_PW" | tigervncpasswd -f > /root/.vnc/passwd && \
+    echo "$VNC_PW" | vncpasswd -f > /root/.vnc/passwd && \
     chmod 600 /root/.vnc/passwd
 
 # -- 4. VNC xstartup -----------------------------------------------
@@ -81,7 +81,7 @@ set -e
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
 
 # Dynamically update VNC password if env var changed at runtime
-echo "$VNC_PW" | tigervncpasswd -f > /root/.vnc/passwd
+echo "$VNC_PW" | vncpasswd -f > /root/.vnc/passwd
 chmod 600 /root/.vnc/passwd
 
 # Start the VNC server (Xtigervnc) on display :1
