@@ -45,32 +45,41 @@ ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 
 # TigerVNC in Trixie uses ~/.config/tigervnc (NOT ~/.vnc)
-# Remove ~/.vnc entirely so the migration check never triggers
 RUN rm -rf /root/.vnc && \
     mkdir -p /root/.config/tigervnc
 
-# Create xstartup in the NEW config path
+# Create xstartup
 RUN printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\nexec startxfce4\n' \
     > /root/.config/tigervnc/xstartup && \
     chmod 755 /root/.config/tigervnc/xstartup
 
-# Create noVNC index.html symlink if missing
+# noVNC index.html symlink
 RUN if [ ! -f /usr/share/novnc/index.html ]; then \
       ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html; \
     fi
 
-# Create startup script
+# Startup script
 RUN printf '#!/bin/bash\n\
-set -e\n\
 \n\
-# Clean stale locks from previous runs\n\
+# Railway injects PORT — use it for the web listener\n\
+if [ -n "$PORT" ]; then\n\
+  NOVNC_PORT="$PORT"\n\
+fi\n\
+\n\
+echo "========================================"\n\
+echo "[*] NOVNC_PORT=$NOVNC_PORT"\n\
+echo "[*] VNC_PORT=$VNC_PORT"\n\
+echo "[*] PORT=$PORT (Railway injected)"\n\
+echo "========================================"\n\
+\n\
+# Clean stale locks\n\
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1\n\
 \n\
-# Ensure config dir exists, remove old .vnc to prevent migration errors\n\
+# Prevent migration error\n\
 rm -rf /root/.vnc\n\
 mkdir -p /root/.config/tigervnc\n\
 \n\
-# Generate VNC password at runtime\n\
+# Generate VNC password\n\
 VNCPASSWD_BIN=$(which vncpasswd 2>/dev/null || which tigervncpasswd 2>/dev/null || echo "")\n\
 if [ -n "$VNCPASSWD_BIN" ]; then\n\
   echo "$VNC_PW" | "$VNCPASSWD_BIN" -f > /root/.config/tigervnc/passwd\n\
@@ -85,6 +94,7 @@ if [ ! -f /root/.config/tigervnc/xstartup ]; then\n\
   chmod 755 /root/.config/tigervnc/xstartup\n\
 fi\n\
 \n\
+# Start VNC server (do NOT use set -e, tigervncserver can return non-zero on success)\n\
 echo "[*] Starting VNC server on :1 ..."\n\
 tigervncserver :1 \\\n\
   -geometry "$VNC_RESOLUTION" \\\n\
@@ -93,27 +103,27 @@ tigervncserver :1 \\\n\
   -SecurityTypes VncAuth \\\n\
   -passwd /root/.config/tigervnc/passwd \\\n\
   -xstartup /root/.config/tigervnc/xstartup \\\n\
-  --I-KNOW-THIS-IS-INSECURE\n\
+  --I-KNOW-THIS-IS-INSECURE 2>&1\n\
 \n\
-echo "[*] VNC server started (port $VNC_PORT)"\n\
-echo "[*] Starting noVNC on port $NOVNC_PORT ..."\n\
+# Give VNC a moment to bind\n\
+sleep 2\n\
 \n\
-websockify --web /usr/share/novnc "$NOVNC_PORT" localhost:"$VNC_PORT" &\n\
-WSPID=$!\n\
-\n\
-echo "[*] Ready! Open your browser to port $NOVNC_PORT"\n\
-\n\
-wait $WSPID\n\
-' > /startup.sh && chmod 755 /startup.sh
-
-# Railway-compatible entrypoint
-RUN printf '#!/bin/bash\n\
-if [ -n "$PORT" ]; then\n\
-  export NOVNC_PORT="$PORT"\n\
+# Verify VNC is actually listening\n\
+if ss -tlnp | grep -q ":$VNC_PORT"; then\n\
+  echo "[*] VNC server confirmed listening on port $VNC_PORT"\n\
+else\n\
+  echo "[!] WARNING: VNC server may not be running on port $VNC_PORT"\n\
+  echo "[!] Checking processes:"\n\
+  ps aux | grep -i vnc\n\
+  echo "[!] Checking ports:"\n\
+  ss -tlnp\n\
 fi\n\
-exec /startup.sh\n\
-' > /entrypoint.sh && chmod 755 /entrypoint.sh
+\n\
+# Start websockify (noVNC) on the Railway-facing port\n\
+echo "[*] Starting noVNC websockify on port $NOVNC_PORT -> localhost:$VNC_PORT"\n\
+websockify --web /usr/share/novnc "$NOVNC_PORT" localhost:"$VNC_PORT"\n\
+' > /startup.sh && chmod 755 /startup.sh
 
 EXPOSE 6080
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/startup.sh"]
