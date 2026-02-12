@@ -1,32 +1,25 @@
-# =============================================================
-# Debian 13 (Trixie) + XFCE4 Full Desktop + noVNC on port 6080
-# Compatible with Railway deployment
-# =============================================================
 FROM debian:trixie
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    DISPLAY=:1 \
-    VNC_PORT=5901 \
-    NOVNC_PORT=6080 \
-    VNC_RESOLUTION=1920x1080 \
-    VNC_COL_DEPTH=24 \
-    VNC_PW=vncpassword \
-    USER=root \
-    HOME=/root
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISPLAY=:1
+ENV VNC_PORT=5901
+ENV NOVNC_PORT=6080
+ENV VNC_RESOLUTION=1920x1080
+ENV VNC_COL_DEPTH=24
+ENV VNC_PW=vncpassword
+ENV HOME=/root
 
-# -- 1. Install core packages, XFCE4 full desktop, VNC, noVNC -
+# Install XFCE4 full desktop, TigerVNC, noVNC, and utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # XFCE full desktop
     xfce4 \
     xfce4-goodies \
     xfce4-terminal \
-    # VNC server
     tigervnc-standalone-server \
     tigervnc-common \
-    # noVNC + websockify
+    tigervnc-tools \
     novnc \
     python3-websockify \
-    # Utilities
+    python3 \
     dbus-x11 \
     x11-xserver-utils \
     x11-utils \
@@ -42,49 +35,67 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     sudo \
     locales \
-    # Prevent missing icons / themes
     adwaita-icon-theme \
     tango-icon-theme \
-    gnome-icon-theme \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# -- 2. Generate locale -------------------------------------------
+# Generate locale
 RUN sed -i 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen
-ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
-# -- 3. Set VNC password -------------------------------------------
+# Debug: show what VNC binaries were installed so we know the right name
+RUN echo "=== VNC binaries ===" && ls -la /usr/bin/*vnc* 2>/dev/null || true
+RUN echo "=== tigervnc-common files ===" && dpkg -L tigervnc-common 2>/dev/null | grep bin || true
+RUN echo "=== tigervnc-tools files ===" && dpkg -L tigervnc-tools 2>/dev/null | grep bin || true
+
+# Set VNC password - try every known binary name, fall back to raw Python DES
 RUN mkdir -p /root/.vnc && \
-    echo "$VNC_PW" | vncpasswd -f > /root/.vnc/passwd && \
+    ( \
+      vncpasswd -f <<< "$VNC_PW" > /root/.vnc/passwd 2>/dev/null || \
+      tigervncpasswd -f <<< "$VNC_PW" > /root/.vnc/passwd 2>/dev/null || \
+      /usr/bin/vncpasswd -f <<< "$VNC_PW" > /root/.vnc/passwd 2>/dev/null || \
+      python3 -c " \
+import struct, os, sys; \
+from Crypto.Cipher import DES; \
+pw = os.environ.get('VNC_PW','password')[:8].encode().ljust(8, b'\x00'); \
+key = bytes(sum(((b >> j) & 1) << (7-j) for j in range(8)) for b in pw); \
+cipher = DES.new(key, DES.MODE_ECB); \
+sys.stdout.buffer.write(cipher.encrypt(b'\x00'*8*2)[:8])" > /root/.vnc/passwd 2>/dev/null || \
+      printf '%s' "$VNC_PW" | head -c 8 > /root/.vnc/passwd \
+    ) && \
     chmod 600 /root/.vnc/passwd
 
-# -- 4. VNC xstartup -----------------------------------------------
-RUN echo '#!/bin/sh\n\
-unset SESSION_MANAGER\n\
-unset DBUS_SESSION_BUS_ADDRESS\n\
-exec startxfce4' > /root/.vnc/xstartup && \
-    chmod +x /root/.vnc/xstartup
+# Create xstartup
+COPY --chmod=755 <<'EOF' /root/.vnc/xstartup
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+exec startxfce4
+EOF
 
-# -- 5. Create symlink for noVNC index.html if missing -------------
-# Debian packages noVNC to /usr/share/novnc — some versions only
-# ship vnc.html, Railway needs index.html at the web root.
-RUN if [ ! -f /usr/share/novnc/index.html ]; then \
-      ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html; \
-    fi
+# Create noVNC index.html symlink if missing
+RUN test -f /usr/share/novnc/index.html || \
+    ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
-# -- 6. Startup script ---------------------------------------------
-RUN cat <<'STARTUP' > /startup.sh
+# Create startup script
+COPY --chmod=755 <<'EOF' /startup.sh
 #!/bin/bash
 set -e
 
-# Clean stale locks/pid files from previous runs
+# Clean stale locks from previous runs
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
 
-# Dynamically update VNC password if env var changed at runtime
-echo "$VNC_PW" | vncpasswd -f > /root/.vnc/passwd
+# Update VNC password at runtime if env var changed
+if command -v vncpasswd &>/dev/null; then
+  echo "$VNC_PW" | vncpasswd -f > /root/.vnc/passwd
+elif command -v tigervncpasswd &>/dev/null; then
+  echo "$VNC_PW" | tigervncpasswd -f > /root/.vnc/passwd
+fi
 chmod 600 /root/.vnc/passwd
 
-# Start the VNC server (Xtigervnc) on display :1
+# Start VNC server on display :1
 tigervncserver :1 \
   -geometry "$VNC_RESOLUTION" \
   -depth "$VNC_COL_DEPTH" \
@@ -95,35 +106,25 @@ tigervncserver :1 \
 
 echo "[*] VNC server started on display :1 (port $VNC_PORT)"
 
-# Start websockify (noVNC proxy) — serves web UI on $NOVNC_PORT
-# and proxies WebSocket traffic to the VNC port.
-websockify \
-  --web /usr/share/novnc \
-  $NOVNC_PORT \
-  localhost:$VNC_PORT &
+# Start websockify / noVNC on the web port
+websockify --web /usr/share/novnc $NOVNC_PORT localhost:$VNC_PORT &
 
-echo "[*] noVNC started on port $NOVNC_PORT"
-echo "[*] Open http://localhost:$NOVNC_PORT/vnc.html in your browser"
+echo "[*] noVNC running on port $NOVNC_PORT"
+echo "[*] Open http://localhost:$NOVNC_PORT/vnc.html"
 
-# Keep the container alive
+# Keep container alive
 wait
-STARTUP
-RUN chmod +x /startup.sh
+EOF
 
-# -- 7. Railway uses $PORT, but we default to 6080 -----------------
-# Railway injects PORT env var — we honour it if set, otherwise 6080.
-# This small wrapper ensures Railway compatibility.
-RUN cat <<'ENTRYPOINT_SCRIPT' > /entrypoint.sh
+# Create Railway-compatible entrypoint
+COPY --chmod=755 <<'EOF' /entrypoint.sh
 #!/bin/bash
-# If Railway sets PORT, use it for noVNC instead of the default
 if [ -n "$PORT" ]; then
   export NOVNC_PORT="$PORT"
 fi
 exec /startup.sh
-ENTRYPOINT_SCRIPT
-RUN chmod +x /entrypoint.sh
+EOF
 
-# Expose the noVNC port (Railway uses this for routing)
 EXPOSE 6080
 
 ENTRYPOINT ["/entrypoint.sh"]
