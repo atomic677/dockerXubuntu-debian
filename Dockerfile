@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xfce4-goodies \
     tigervnc-standalone-server \
     tigervnc-common \
+    tigervnc-tools \
     novnc \
     python3-websockify \
     python3 \
@@ -53,6 +54,10 @@ RUN printf '#!/bin/bash\nunset SESSION_MANAGER\nunset DBUS_SESSION_BUS_ADDRESS\n
     > /root/.config/tigervnc/xstartup && \
     chmod 755 /root/.config/tigervnc/xstartup
 
+# Generate default VNC password at build time (can be overridden at runtime via VNC_PW env)
+RUN echo "$VNC_PW" | tigervncpasswd -f > /root/.config/tigervnc/passwd && \
+    chmod 600 /root/.config/tigervnc/passwd
+
 # noVNC index.html symlink
 RUN if [ ! -f /usr/share/novnc/index.html ]; then \
       ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html; \
@@ -81,15 +86,27 @@ rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
 rm -rf /root/.vnc
 mkdir -p /root/.config/tigervnc
 
-# Generate VNC password
-VNCPASSWD_BIN=$(command -v vncpasswd 2>/dev/null || command -v tigervncpasswd 2>/dev/null)
-if [ -n "${VNCPASSWD_BIN:-}" ]; then
+# Generate VNC password — try multiple paths, fall back to build-time passwd
+VNCPASSWD_BIN=""
+for candidate in /usr/bin/tigervncpasswd /usr/bin/vncpasswd; do
+  if [ -x "$candidate" ]; then
+    VNCPASSWD_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$VNCPASSWD_BIN" ]; then
+  VNCPASSWD_BIN=$(command -v tigervncpasswd 2>/dev/null || command -v vncpasswd 2>/dev/null || true)
+fi
+if [ -n "$VNCPASSWD_BIN" ]; then
   echo "$VNC_PW" | "$VNCPASSWD_BIN" -f > /root/.config/tigervnc/passwd
+  chmod 600 /root/.config/tigervnc/passwd
+  echo "[*] VNC password generated with $VNCPASSWD_BIN"
+elif [ -f /root/.config/tigervnc/passwd ]; then
+  echo "[*] Using build-time VNC password (tigervncpasswd not found at runtime)"
 else
-  echo "[!] FATAL: vncpasswd not found — cannot generate VNC password"
+  echo "[!] FATAL: No vncpasswd binary and no build-time password file"
   exit 1
 fi
-chmod 600 /root/.config/tigervnc/passwd
 
 # Ensure xstartup exists
 if [ ! -f /root/.config/tigervnc/xstartup ]; then
